@@ -1,0 +1,348 @@
+#define BLYNK_PRINT Serial
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <RTClib.h>
+#include <HX711.h>
+#include <ESP32Servo.h>
+#include "config.h"
+
+// ==========================================
+// CÁC ĐỐI TƯỢNG VÀ KHAI BÁO BIẾN TOÀN CỤC
+// ==========================================
+// Khai báo màn hình OLED SSD1306 (128x64)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1 // Dùng chung chân reset của ESP32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Khai báo thời gian thực RTC DS1307
+RTC_DS1307 rtc;
+
+// Khai báo cảm biến cân nặng HX711
+HX711 scale;
+
+// Khai báo động cơ Servo
+Servo feedServo;
+
+// Khai báo đối tượng BlynkTimer để chạy các tác vụ định kỳ thay cho delay()
+BlynkTimer timer;
+
+// Các biến lưu trữ dữ liệu cảm biến và cài đặt
+float foodWeight = 0.0;
+int waterLevel = 0;
+bool isWaterLow = false;
+bool isFoodLow = false;
+
+// Biến lưu cấu hình hẹn giờ cho ăn (mặc định 07:00 sáng)
+int targetHour = 7;
+int targetMinute = 0;
+bool fedToday = false; // Cờ đánh dấu đã cho ăn tại khung giờ hiện tại
+
+// Biến điều khiển thủ công và trạng thái máy bơm
+bool manualPumpActive = false;
+unsigned long pumpStartTime = 0;
+bool isPumpRunning = false;
+
+
+
+// Hàm phát còi Buzzer với tần số và thời gian tùy chỉnh
+void beepBuzzer(int count, int delayMs) {
+  for (int i = 0; i < count; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(delayMs);
+    digitalWrite(BUZZER_PIN, LOW);
+    if (i < count - 1) {
+      delay(delayMs);
+    }
+  }
+}
+
+// Hàm thực hiện hành động xả thức ăn bằng Servo
+void dispenseFood() {
+  Serial.println("System: Dispensing food...");
+  Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "Dang cho an...");
+  
+  // Phát còi báo hiệu chuẩn bị cho ăn
+  beepBuzzer(2, 200); 
+  
+  // Quay servo để mở cửa xả thức ăn
+  feedServo.write(SERVO_OPEN_ANGLE);
+  delay(FEEDING_DURATION); // Giữ cửa xả trong khoảng thời gian xác định
+  
+  // Quay servo đóng cửa xả lại
+  feedServo.write(SERVO_CLOSE_ANGLE);
+  
+  Serial.println("System: Food dispensing completed.");
+  Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "Da cho an xong");
+}
+
+// Hàm khởi động/tắt máy bơm nước
+void setPump(bool state) {
+  if (state) {
+    digitalWrite(PUMP_RELAY_PIN, LOW); // Kích hoạt relay (Mạch relay active LOW)
+    isPumpRunning = true;
+    pumpStartTime = millis();
+    Serial.println("Pump: ON");
+  } else {
+    digitalWrite(PUMP_RELAY_PIN, HIGH); // Tắt relay
+    isPumpRunning = false;
+    manualPumpActive = false;
+    Blynk.virtualWrite(VPIN_MANUAL_PUMP, 0);
+    Serial.println("Pump: OFF");
+  }
+}
+
+
+
+// Hàm đọc và cập nhật các cảm biến (chạy định kỳ qua BlynkTimer)
+void updateSensors() {
+  // 1. Đọc khối lượng thức ăn còn lại từ Loadcell
+  if (scale.is_ready()) {
+    foodWeight = scale.get_units(5); // Đọc trung bình 5 lần
+    if (foodWeight < 0) foodWeight = 0; // Tránh hiển thị giá trị âm nhỏ do sai số
+  } else {
+    Serial.println("HX711: Sensor not found!");
+  }
+
+  // 2. Đọc mực nước từ cảm biến analog
+  waterLevel = analogRead(WATER_LEVEL_PIN);
+  
+  // Kiểm tra ngưỡng nước thấp
+  if (waterLevel < WATER_LOW_THRESHOLD) {
+    isWaterLow = true;
+  } else {
+    isWaterLow = false;
+  }
+
+  // Kiểm tra ngưỡng thức ăn thấp (Dưới 50g được coi là sắp hết thức ăn)
+  if (foodWeight < 50.0) {
+    isFoodLow = true;
+  } else {
+    isFoodLow = false;
+  }
+
+  // In thông tin debug ra Serial
+  Serial.print("Sensors -> Food: ");
+  Serial.print(foodWeight);
+  Serial.print(" g | Water Level ADC: ");
+  Serial.println(waterLevel);
+
+  // 3. Gửi dữ liệu cảm biến lên Blynk IoT Cloud
+  Blynk.virtualWrite(VPIN_FOOD_WEIGHT, foodWeight);
+  Blynk.virtualWrite(VPIN_WATER_STATUS, isWaterLow ? 0 : 1); // 0: Cạn, 1: Bình thường
+  
+  // 4. Phát còi báo động liên tục nếu đồng thời hết cả đồ ăn và nước uống
+  if (isFoodLow && isWaterLow) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "CANH BAO: het do an & nuoc!");
+  } else {
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+// Hàm xử lý logic chính và kiểm tra hẹn giờ (chạy định kỳ mỗi 1 giây)
+void checkSystemLogic() {
+  DateTime now = rtc.now();
+  
+  // 1. Kiểm tra điều kiện hẹn giờ cho ăn
+  if (now.hour() == targetHour && now.minute() == targetMinute) {
+    if (!fedToday) {
+      dispenseFood();
+      fedToday = true; // Đánh dấu đã cho ăn
+    }
+  } else {
+    fedToday = false; // Reset cờ khi qua phút khác
+  }
+
+  // 2. Kiểm tra điều kiện tự động bơm nước
+  if (isWaterLow && !isPumpRunning && !manualPumpActive) {
+    // Nếu hết nước, không bật thủ công và máy bơm đang tắt -> tự động bật bơm
+    setPump(true);
+    Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "Tu dong bom nuoc...");
+  }
+  
+  // 3. Bảo vệ máy bơm (Chống tràn hoặc chống cháy bơm khi cạn nguồn cấp nước)
+  if (isPumpRunning) {
+    // Nếu nước đã đầy (vượt ngưỡng thấp) hoặc máy bơm chạy quá thời gian tối đa PUMP_MAX_ON_TIME
+    if (!isWaterLow || (millis() - pumpStartTime >= PUMP_MAX_ON_TIME)) {
+      setPump(false);
+      Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "Da ngat may bom");
+    }
+  }
+}
+
+// Hàm cập nhật màn hình OLED SSD1306 (chạy định kỳ mỗi 1 giây)
+void updateOLED() {
+  DateTime now = rtc.now();
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  // Dòng 1: Hiển thị thời gian thực
+  display.setCursor(0, 0);
+  display.print("Time: ");
+  if (now.hour() < 10) display.print('0');
+  display.print(now.hour(), DEC);
+  display.print(':');
+  if (now.minute() < 10) display.print('0');
+  display.print(now.minute(), DEC);
+  display.print(':');
+  if (now.second() < 10) display.print('0');
+  display.print(now.second(), DEC);
+
+  // Dòng 2: Hiển thị lịch hẹn cho ăn
+  display.setCursor(0, 15);
+  display.print("Alarm: ");
+  if (targetHour < 10) display.print('0');
+  display.print(targetHour);
+  display.print(':');
+  if (targetMinute < 10) display.print('0');
+  display.print(targetMinute);
+
+  // Dòng 3: Khối lượng thức ăn hiện tại
+  display.setCursor(0, 32);
+  display.print("Food: ");
+  display.print(foodWeight, 1);
+  display.print(" g");
+  if (isFoodLow) display.print(" (Low!)");
+
+  // Dòng 4: Trạng thái nước uống
+  display.setCursor(0, 48);
+  display.print("Water: ");
+  if (isWaterLow) {
+    display.print("LOW (Refilling)");
+  } else {
+    display.print("OK");
+  }
+  
+  // Trạng thái máy bơm
+  if (isPumpRunning) {
+    display.print(" [PUMP]");
+  }
+
+  display.display();
+}
+
+
+
+// Nhận lệnh từ nút bấm "Cho ăn thủ công" (Virtual Pin V3)
+BLYNK_WRITE(VPIN_MANUAL_FEED) {
+  int val = param.asInt();
+  if (val == 1) {
+    dispenseFood();
+    Blynk.virtualWrite(VPIN_MANUAL_FEED, 0); // Tự động trả trạng thái nút bấm về 0
+  }
+}
+
+// Nhận lệnh từ nút bấm "Bơm nước thủ công" (Virtual Pin V4)
+BLYNK_WRITE(VPIN_MANUAL_PUMP) {
+  int val = param.asInt();
+  if (val == 1) {
+    manualPumpActive = true;
+    setPump(true);
+  } else {
+    setPump(false);
+  }
+}
+
+// Nhận cài đặt Giờ cho ăn từ thanh trượt/nhập liệu (Virtual Pin V5)
+BLYNK_WRITE(VPIN_SET_HOUR) {
+  int val = param.asInt();
+  if (val >= 0 && val <= 23) {
+    targetHour = val;
+    Serial.print("Blynk: Set hour to ");
+    Serial.println(targetHour);
+  }
+}
+
+// Nhận cài đặt Phút cho ăn từ thanh trượt/nhập liệu (Virtual Pin V6)
+BLYNK_WRITE(VPIN_SET_MINUTE) {
+  int val = param.asInt();
+  if (val >= 0 && val <= 59) {
+    targetMinute = val;
+    Serial.print("Blynk: Set minute to ");
+    Serial.println(targetMinute);
+  }
+}
+
+// Sự kiện chạy khi ESP32 đồng bộ dữ liệu lúc kết nối thành công với Blynk
+BLYNK_CONNECTED() {
+  Serial.println("Blynk: Connected, syncing parameters...");
+  Blynk.syncVirtual(VPIN_SET_HOUR);
+  Blynk.syncVirtual(VPIN_SET_MINUTE);
+  Blynk.virtualWrite(VPIN_SYSTEM_STATUS, "ESP32 Hoat dong");
+}
+
+
+void setup() {
+  // Khởi tạo Serial Debug
+  Serial.begin(115200);
+
+  // Cấu hình GPIO cho các cơ cấu chấp hành và cảm biến
+  pinMode(PUMP_RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(PUMP_RELAY_PIN, HIGH); // Tắt máy bơm ban đầu (Active LOW relay)
+  digitalWrite(BUZZER_PIN, LOW);       // Tắt còi báo ban đầu
+
+  // Khởi tạo Bus I2C tùy biến chân
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+
+  // Khởi tạo màn hình OLED SSD1306
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Địa chỉ I2C mặc định 0x3C
+    Serial.println(r"OLED: SSD1306 initialization failed!");
+    for (;;); // Dừng hệ thống nếu không có OLED
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 20);
+  display.println("Smart Pet Feeder");
+  display.println("Connecting WiFi...");
+  display.display();
+
+  // Khởi tạo RTC DS1307
+  if (!rtc.begin()) {
+    Serial.println("RTC: Could not find RTC module!");
+  } else if (!rtc.isrunning()) {
+    Serial.println("RTC: RTC is NOT running! Adjusting time...");
+    // Cài đặt thời gian của RTC theo thời gian build code của máy tính
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+  }
+
+  // Khởi tạo cảm biến Load Cell HX711
+  scale.begin(HX711_DOUT_PIN, HX711_SCK_PIN);
+  scale.set_scale(LOADCELL_CALIBRATION_FACTOR); 
+  scale.tare(); // Thiết lập giá trị bì (khối lượng ban đầu khi khay rỗng là 0g)
+
+  // Khởi tạo động cơ Servo điều khiển bằng ESP32Servo
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  feedServo.setPeriodHertz(50); // Servo tiêu chuẩn chạy ở tần số 50Hz
+  feedServo.attach(SERVO_PIN, 500, 2400); // Gắn chân servo với xung min/max
+  feedServo.write(SERVO_CLOSE_ANGLE);     // Đóng nắp xả lúc khởi đầu
+
+  // Kết nối WiFi và Blynk Cloud
+  Serial.println("System: Connecting to Blynk...");
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+  
+  // Khởi tạo các sự kiện định kỳ chạy bằng BlynkTimer
+  timer.setInterval(2000L, updateSensors);       // Đọc dữ liệu cảm biến định kỳ mỗi 2 giây
+  timer.setInterval(1000L, checkSystemLogic);    // Kiểm tra logic tự động và hẹn giờ mỗi 1 giây
+  timer.setInterval(1000L, updateOLED);         // Cập nhật hiển thị OLED mỗi 1 giây
+
+  Serial.println("System: Initialization completed successfully.");
+  beepBuzzer(3, 100); // Kêu còi 3 tiếng báo hiệu khởi động thành công
+}
+
+void loop() {
+  Blynk.run(); // Xử lý các giao dịch với Blynk Cloud
+  timer.run(); // Quản lý và kích hoạt các tác vụ định kỳ của BlynkTimer
+}
